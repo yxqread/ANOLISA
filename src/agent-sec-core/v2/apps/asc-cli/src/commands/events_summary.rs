@@ -8,6 +8,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::output::escape_ctl;
+
 /// Produces the v1 summary text for `events` (newest-first from the daemon).
 #[must_use]
 pub fn format_summary(events: &[Value], time_label: &str) -> String {
@@ -105,12 +107,21 @@ fn request_of(event: &Value) -> Value {
         .unwrap_or_else(|| Value::Object(Map::new()))
 }
 
+/// `details.result.<field>` as a rendered string.
+///
+/// These accessors are the chokepoint every event-derived string in the
+/// report passes through, and event payloads carry bytes the operator's
+/// terminal must never execute raw: a prompt-scan summary quotes the
+/// matched evidence (bytes of the scanned prompt), and hardening/verify
+/// errors can quote bytes of the files those tools read. Control bytes are
+/// therefore escaped to visible mnemonics here; clean values are unchanged.
 fn result_str(event: &Value, field: &str) -> String {
-    result_of(event)
-        .get(field)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    escape_ctl(
+        result_of(event)
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
 }
 
 fn result_u64(event: &Value, field: &str) -> u64 {
@@ -121,20 +132,22 @@ fn result_u64(event: &Value, field: &str) -> u64 {
 }
 
 fn request_str(event: &Value, field: &str) -> String {
-    request_of(event)
-        .get(field)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    escape_ctl(
+        request_of(event)
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
 }
 
 fn details_str(event: &Value, field: &str) -> String {
-    event
-        .get("details")
-        .and_then(|details| details.get(field))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    escape_ctl(
+        event
+            .get("details")
+            .and_then(|details| details.get(field))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
 }
 
 /// Full-skill verification has `skill` absent or null in the request.
@@ -956,6 +969,65 @@ mod tests {
             text.contains("agent-sec-cli skill-ledger check <dir>"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn control_bytes_in_event_fields_are_escaped_not_printed_raw() {
+        // The report is printed straight to the operator's terminal, and
+        // its event-derived fields carry bytes nobody but the scanned
+        // content controls: the prompt-scan summary quotes the matched
+        // evidence, a skill-ledger reason and skill_dir can carry file
+        // bytes, and a hardening error quotes the failing tool's output.
+        // A raw ESC turns what follows into a live CSI/OSC command, CR
+        // rewrites the line and LF forges a new report line.
+        let events = vec![
+            scan_event(
+                "prompt_scan",
+                "succeeded",
+                &json!({"result": {
+                    "verdict": "deny",
+                    "threat_type": "prompt_injection",
+                    "summary": "attack: ignore \u{1b}[2J\u{1b}]0;pwned\u{7} the system prompt",
+                }}),
+            ),
+            scan_event(
+                "hardening",
+                "failed",
+                &json!({
+                    "result": {"mode": "scan"},
+                    "error": "loongshield failed on \u{1b}[31mconfig\u{1b}[0m",
+                }),
+            ),
+            scan_event(
+                "skill_ledger",
+                "succeeded",
+                &json!({
+                    "result": {"command": "check", "status": "tampered", "reason": "\r overwritten"},
+                    "request": {"skill_dir": "/s/a\u{1b}[2Db"},
+                }),
+            ),
+        ];
+        let text = format_summary(&events, "last 24 hours");
+        // The report keeps its own line structure, but no other control
+        // byte survives into it.
+        assert!(
+            !text.chars().any(|c| c != '\n' && c.is_control()),
+            "{text:?}"
+        );
+        // The attacker-controlled content stays visible as mnemonics
+        // instead of being dropped or executed.
+        assert!(
+            text.contains("ignore \\x1b[2J\\x1b]0;pwned\\x07 the system prompt"),
+            "{text}"
+        );
+        assert!(
+            text.contains("loongshield failed on \\x1b[31mconfig\\x1b[0m"),
+            "{text}"
+        );
+        assert!(text.contains("\\r overwritten"), "{text}");
+        // A byte-forged report line is impossible: the LF is escaped, so
+        // the forged text stays inline on the threat line.
+        assert!(text.contains("system prompt"), "{text}");
     }
 
     #[test]
